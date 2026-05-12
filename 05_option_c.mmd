@@ -1,0 +1,33 @@
+sequenceDiagram
+    participant Caller as LiveKit AvatarRunner
+    participant Gen as AlwaysBusyGenerator
+    participant Drv as InferenceDriver
+    participant Sess as InferenceSession
+    participant Ctx as _SessionContext (boundary ring)
+    participant Triton as Triton worker
+
+    Note over Sess,Triton: Talking chunk N in flight.<br/>40 of 100 frames delivered to consumer.<br/>Output queue holds approx 7 buffered frames.
+
+    Triton-->>Sess: partial InferResponse (frame_offset=40, motion_ctx_40, audio_ctx_40)
+    Sess->>Ctx: update boundary ring at offset 40
+
+    Caller->>Gen: interrupt()
+    Gen->>Drv: read slice_point = stream.n_emitted (40) + qsize (approx 7) = 47
+    Gen->>Drv: _stop_talking_phase (aborts InferenceStream, producer task ends)
+    Gen->>Drv: _restart_idle_phase (start new idle stream)
+
+    Note over Gen,Drv: pick idle's first chunk and submit via submit_with_cancel
+
+    Gen->>Sess: submit_with_cancel(idle_chunk, slice_point=47)
+    Sess->>Ctx: look up boundary tensors at offset <= 47 → (motion_ctx_44, audio_ctx_44)<br/>(closest RGBA boundary not exceeding 47)
+    Sess->>Triton: request(cancel_previous=True, prev_motion_feat=ctx_44, prev_audio_feat=ctx_44)
+
+    Triton->>Triton: next RGBA boundary → set cancel, flush final partial, free slot
+    Triton-->>Sess: cancelled response (was_cancelled=True, partial frames up to boundary)
+    Note over Sess,Ctx: orchestrator discards extra video frames past slice_point<br/>(or worker stops emitting after slice_point)
+
+    Triton-->>Sess: new idle chunk response (continues from context_44)
+    Sess-->>Drv: on_frame(video) for new idle, paired with silence audio
+    Drv->>Caller: yield (video, audio) via _output_queue
+
+    Note over Caller,Drv: approx 0-160ms transition (one RGBA boundary) + buffer drain - perceptually instant

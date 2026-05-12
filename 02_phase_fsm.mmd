@@ -1,0 +1,28 @@
+stateDiagram-v2
+    [*] --> IDLE_ONLY: __aiter__ starts<br/>_start_idle_phase
+
+    IDLE_ONLY --> WARMING: push_audio(frame)<br/>start talking,<br/>idle keeps running
+
+    WARMING --> TALKING: on_first_chunk<br/>_stop_idle_phase
+
+    TALKING --> IDLE_ONLY: on_finished (talking task done)<br/>_restart_idle_phase
+
+    WARMING --> IDLE_ONLY: interrupt()<br/>_stop_talking_phase<br/>+ _restart_idle_phase
+
+    TALKING --> IDLE_ONLY: interrupt()<br/>_stop_talking_phase<br/>+ _restart_idle_phase
+
+    IDLE_ONLY --> [*]: aclose()
+    WARMING --> [*]: aclose()
+    TALKING --> [*]: aclose()
+
+    note right of WARMING
+        Both slots set.
+        Driver is still
+        consuming idle stream.
+    end note
+
+    note right of TALKING
+        Only talking slot set.
+        Driver consuming
+        talking stream.
+    end note

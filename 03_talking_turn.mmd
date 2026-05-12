@@ -1,0 +1,49 @@
+sequenceDiagram
+    participant Caller as LiveKit AvatarRunner
+    participant Gen as AlwaysBusyGenerator
+    participant Talk as produce_talking
+    participant Stream as InferenceStream
+    participant Drv as InferenceDriver
+    participant Sess as InferenceSession
+    participant Obs as TalkingSequenceObserver
+
+    Note over Gen: state: IDLE_ONLY
+
+    Caller->>Gen: push_audio(frame_0)
+    Gen->>Gen: acquire_sequence + _start_talking_phase
+    Gen->>Talk: task created (input_queue, stream, on_first_chunk)
+    Gen->>Stream: _streams.put_nowait(talking_stream)
+    Note over Gen: state: WARMING (idle still driving)
+
+    Talk->>Talk: preprocess frame_0 + flush
+    Talk->>Stream: stream.put(chunk_0)
+    Stream->>Drv: chunk_0 (driver still on idle)
+
+    Note over Talk: emit() calls on_first_chunk()
+    Talk->>Gen: on_first_chunk
+    Gen->>Gen: _stop_idle_phase (abort idle stream)
+    Note over Gen: state: TALKING
+
+    Drv->>Drv: drain idle's ABORTED end (skipped, label=IDLE)
+    Drv->>Stream: get() chunk_0
+    Drv->>Sess: infer_chunk(request, on_frame)
+    Sess-->>Drv: on_frame(video_0..N)
+    Drv->>Drv: pair with chunk.broadcast_audio (memoryview)
+    Drv->>Obs: PairedFrame(label=TALKING) via output_queue
+    Obs->>Obs: on_frame → start_sequence (first frame)
+    Obs->>Caller: yield (video, audio)
+
+    Caller->>Gen: push_audio(AudioEnd)
+    Gen->>Stream: input_queue.put(AudioEnd) + shutdown()
+    Note over Gen: post-end pushes raise QueueShutDown → dropped
+
+    Talk->>Talk: reads AudioEnd → preprocessor.flush
+    Talk->>Stream: stream.put(final_chunks) + put(None) [COMPLETED]
+    Talk-->>Gen: task done → on_finished
+    Gen->>Gen: clear _talking_phase + _restart_idle_phase
+    Note over Gen: state: IDLE_ONLY (new idle)
+
+    Drv->>Stream: get() COMPLETED
+    Drv->>Obs: StreamEnd(COMPLETED, label=TALKING)
+    Obs->>Obs: end_sequence
+    Obs->>Caller: yield SequenceEnd(COMPLETED)

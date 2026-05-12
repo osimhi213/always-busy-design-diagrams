@@ -1,0 +1,52 @@
+graph LR
+    subgraph caller["LiveKit consumer"]
+        AR["AvatarRunner<br/>(async for in __aiter__)"]
+    end
+
+    subgraph generator["AlwaysBusyGenerator"]
+        FSM["two-slot FSM<br/>_idle_phase / _talking_phase"]
+        STREAMS["_streams<br/>asyncio.Queue[InferenceStream]"]
+        OBS["TalkingSequenceObserver"]
+    end
+
+    subgraph producers["Producers"]
+        IDLE["produce_idle<br/>(closure from make_idle_producer)"]
+        TALK["produce_talking<br/>(preprocessor + sentiment)"]
+        LC["producer_lifecycle (CM)<br/>COMPLETED sentinel · abort on error"]
+    end
+
+    subgraph driver["InferenceDriver (async with)"]
+        RUN["_run loop<br/>pulls from _streams"]
+        DRV["_drive_stream<br/>per-stream chunk loop"]
+        INF["_infer_chunk<br/>builds Request + on_frame"]
+        OUT["_output_queue<br/>asyncio.Queue[PairedFrame | StreamEnd]"]
+    end
+
+    subgraph triton["InferenceSession (session-lifetime)"]
+        SS["_SessionStream<br/>(one gRPC stream)"]
+        CTX["_SessionContext<br/>motion_ctx / audio_ctx"]
+        CLIENT["ExpressiveAvatarTritonClient<br/>(gRPC decoupled)"]
+    end
+
+    AR -->|push_audio| FSM
+    AR -->|interrupt| FSM
+    AR -->|async for| OUT
+
+    FSM -->|create stream + task| IDLE
+    FSM -->|create stream + task| TALK
+    IDLE -->|stream.put chunks| STREAMS
+    TALK -->|stream.put chunks| STREAMS
+    IDLE -.wrapped by.-> LC
+    TALK -.wrapped by.-> LC
+
+    STREAMS --> RUN
+    RUN --> DRV
+    DRV --> INF
+    INF -->|infer_chunk| SS
+    SS --> CLIENT
+    CLIENT -->|InferResponse| CTX
+    SS -->|on_frame| INF
+    INF -->|PairedFrame| OUT
+
+    OUT -.StreamEnd.-> OBS
+    OBS -->|start/end_sequence| FSM

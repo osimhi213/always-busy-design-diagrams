@@ -1,0 +1,22 @@
+sequenceDiagram
+    participant Drv as InferenceDriver
+    participant Sess as InferenceSession
+    participant SS as _SessionStream (gRPC)
+    participant Ctx as _SessionContext
+    participant Triton as Triton worker
+
+    Drv->>Sess: infer_chunk(Request(audio, correlation_id, sentiment_id), on_frame)
+    Sess->>Ctx: read motion_ctx, audio_ctx
+    Sess->>SS: send_request(audio, prev_motion_feat, prev_audio_feat, ...)
+    SS->>Triton: async_stream_infer (one request, streaming response)
+    Note over SS,Triton: sequence_start=True only on first request<br/>of this stream's lifetime
+
+    loop per video frame
+        Triton-->>SS: InferResponse chunk (video_frames batch, motion_ctx, audio_ctx)
+        SS->>SS: _dispatch_frames(video_frames)
+        SS-->>Drv: on_frame(video, correlation_id)
+    end
+
+    SS->>Ctx: on_response → motion_ctx, audio_ctx updated
+    SS-->>Sess: future resolves
+    Sess-->>Drv: return
