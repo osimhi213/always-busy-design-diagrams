@@ -1,0 +1,39 @@
+sequenceDiagram
+    autonumber
+    participant LK as LiveKit AvatarRunner
+    participant Gen as AlwaysBusyGenerator
+    participant TP as TalkingProducer
+    participant Q as StreamQueue
+    participant Drv as Driver
+    participant Sess as InferenceSession
+    participant W as Triton worker
+
+    Note over Drv,W: steady state — idle stream driving,<br/>broadcast_queue holds ~0.2s of frames
+
+    LK->>Gen: push_audio(frame 0)
+    Gen->>Gen: acquire_sequence → SequenceManager(id)
+    Gen->>TP: create + run task<br/>(sentiment resolved lazily from 1st audio frame)
+    Gen->>Q: driver.commit(talking stream)
+    Note over Q,Drv: ready-gating — idle keeps driving.<br/>No preemption until the stream has content
+
+    TP->>TP: AudioPreprocessor.push per frame —<br/>emits a chunk once 100 frames (4s) accumulate
+    TP->>TP: stream.put(chunk 0) → ready.set()
+
+    Q-->>Drv: get() unblocks — head is ready
+    Drv->>Drv: idle.cancel() · await idle drive<br/>(idle StreamEnd ships after 0.2s re-buffer gate)
+    Note over Gen: idle StreamEnd filtered in __aiter__<br/>(label != TALKING)
+
+    Drv->>Sess: infer_chunk(chunk 0,<br/>cancel_previous=True, pass_prev_context=True)
+    Sess->>W: request: audio + prev_motion/audio_feat = orchestrator<br/>context ring (last ~10 paced frames)<br/>+ request_id_to_cancel = idle's in-flight request
+    W->>W: cancel idle slot work,<br/>continue from prev_motion_feat in the request
+
+    loop partial responses
+        W-->>Sess: InferResponse(video_frames, motion_ctx, audio_ctx)
+        Sess-->>Drv: on_frame(video, commit_to_context) per frame
+        Drv->>Drv: pair with broadcast audio → buffers
+        Drv-->>Gen: PairedFrame(label=TALKING)
+        Gen->>Gen: observer.on_frame → start_sequence (first frame only)
+        Gen-->>LK: yield (video, audio)
+    end
+
+    Note over Drv,Sess: later chunks: cancel_previous=False,<br/>pass_prev_context=False (server-side sequence cache)

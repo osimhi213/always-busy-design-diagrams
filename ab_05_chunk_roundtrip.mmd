@@ -1,0 +1,35 @@
+sequenceDiagram
+    autonumber
+    participant Drv as Driver (dispatcher)
+    participant Sess as InferenceSession
+    participant Ring as Context ring (10)
+    participant SS as _SessionStream (gRPC)
+    participant LB as TritonLoadBalancer
+    participant W as Triton worker
+
+    Drv->>Sess: infer_chunk(Request(audio f32@16k, correlation_id,<br/>sentiment_id, morph_config), on_frame,<br/>pass_prev_context, cancel_previous)
+    opt no open stream
+        Sess->>LB: find_optimal_server(worker_pool)
+        LB-->>Sess: worker URL (Redis, free/cached slots)
+        Sess->>SS: new stream — new Triton sequence_id
+    end
+    opt pass_prev_context
+        Sess->>Ring: read() → stacked prev_motion/audio_feat
+    end
+    Sess->>SS: submit_request(cancel_previous?)
+    SS->>W: async_stream_infer: sequence_id, sequence_start (first req),<br/>sequence_end (always False here — sequence ends via stream close),<br/>request_id, params: avatar_dir, sentiment, morph_config,<br/>request_id_to_cancel, background (first req only)
+
+    loop streamed partial responses
+        W-->>SS: InferResponse(video_frames[N], motion_ctx, audio_ctx)
+        SS->>SS: filter stale request_id → hop to event loop
+        SS-->>Sess: decode: N frames + per-frame (motion, audio)
+        Sess-->>Drv: on_frame(video_i, commit_to_context_i)
+        Note over Drv,Ring: commit fires in the pacer AFTER the frame is enqueued<br/>for broadcast — ring tracks paced (not yet delivered) frames
+    end
+    W-->>SS: empty terminal response
+    SS-->>Sess: drain done
+    Sess-->>Drv: infer_chunk returns
+
+    opt retriable error (model conflict / no slots)
+        Sess->>Sess: close stream (daemon thread) · rotate worker<br/>up to 4 attempts (1 try + 3 retries), pass_prev_context=True
+    end

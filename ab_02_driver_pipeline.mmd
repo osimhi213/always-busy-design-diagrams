@@ -1,0 +1,36 @@
+graph TB
+    subgraph loop["_drive_loop — one task, session lifetime"]
+        RACE{"race:<br/>drive(current) vs StreamQueue.get()"}
+        SPAWN["_spawn_idle<br/>fresh idle stream + producer task"]
+        SWAP["queue head ready first:<br/>current.cancel() · await drive · switch"]
+        ENDED["current ended first:<br/>next = idle"]
+    end
+
+    subgraph ds["_drive_stream — per stream"]
+        direction TB
+        STREAM(["InferenceStream<br/>chunks queue (maxsize 1) · ended Future · ready Event"])
+        DISP["dispatcher task<br/>get chunk → infer_chunk<br/>first chunk: cancel_previous=True, pass_prev_context=True<br/>on StreamEnd: return · on error: stream.error"]
+        IB(["inference_buffer<br/>1.0s = 25 frames<br/>(PairedFrame, commit_to_context)"])
+        PACE["pacer task<br/>relay frame → commit_to_context()<br/>on drain (QueueShutDown): stream.complete()"]
+        GATE["end-marker gate<br/>await stream.ended<br/>race: pacer done vs broadcast at 0.2s target<br/>then put(StreamEnd)"]
+    end
+
+    BQ(["broadcast_queue — TargetedQueue<br/>target = maxsize = 0.2s = 5 frames"])
+    CONS["__anext__ → generator __aiter__<br/>PairedFrame | StreamEnd"]
+    SESS["InferenceSession.infer_chunk<br/>per-frame on_frame callbacks"]
+
+    SPAWN --> RACE
+    RACE --> SWAP
+    RACE --> ENDED
+    ENDED --> SPAWN
+
+    STREAM --> DISP
+    DISP -- "Request" --> SESS
+    SESS -- "on_frame(video, commit)" --> DISP
+    DISP -- "pair with broadcast_audio" --> IB
+    IB --> PACE
+    PACE --> BQ
+    GATE -- "StreamEnd after frames" --> BQ
+    BQ --> CONS
+
+    SWAP -. "cancelled stream still ships its<br/>StreamEnd before the next stream drives" .-> GATE

@@ -1,0 +1,35 @@
+sequenceDiagram
+    autonumber
+    participant LK as LiveKit AvatarRunner
+    participant Gen as AlwaysBusyGenerator
+    participant TP as TalkingProducer
+    participant Drv as Driver
+    participant Sess as InferenceSession
+    participant W as Triton worker
+
+    alt natural end
+        LK->>Gen: push_audio(AudioEnd)
+        Gen->>TP: forward AudioEnd (input closes)
+        TP->>TP: preprocessor.flush() → tail chunks<br/>last tail chunk carries morph_config (talking→idle)<br/>empty flush — no tail chunk, no morph
+        TP->>Drv: stream.put(tail...) · put(None) = in-band COMPLETED
+        Drv->>Drv: dispatcher sees StreamEnd → graceful buffer shutdown
+        Drv->>Drv: pacer drains all remaining frames → stream.complete()
+        Drv-->>Gen: StreamEnd(COMPLETED) after last frame
+        Gen->>Gen: observer.on_end → end_sequence(COMPLETED)
+        Gen-->>LK: yield SequenceEnd(COMPLETED) → AudioSegmentEnd
+    else interrupt (user barge-in)
+        LK->>Gen: clear_buffer → interrupt()
+        Gen->>Gen: stream.cancel() + producer_task.cancel()
+        Note over Drv: ended future resolves CANCELLED immediately.<br/>Frames still in inference_buffer are dropped
+        Drv->>Drv: pacer keeps relaying until broadcast_queue<br/>reaches its 0.2s target (queue full)
+        Drv-->>Gen: StreamEnd(CANCELLED)
+        Drv->>Drv: cancel dispatcher — in-flight Triton request abandoned
+        Gen->>Gen: observer.on_end → end_sequence(CANCELLED)
+        Gen-->>LK: yield SequenceEnd(CANCELLED) → AudioSegmentEnd
+    end
+
+    Drv->>Drv: _spawn_idle — fresh idle stream + producer
+    Drv->>Sess: idle chunk 0: cancel_previous=True,<br/>pass_prev_context=True (context ring)
+    Sess->>W: request_id_to_cancel = abandoned talking request<br/>prev_motion/audio_feat = last ~10 paced frames
+    W->>W: cancel stale work · generate idle<br/>continuing from the pose the user last saw
+    W-->>LK: idle frames flow (via Sess → Drv → Gen)

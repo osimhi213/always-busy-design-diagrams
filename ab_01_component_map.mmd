@@ -1,0 +1,57 @@
+graph TB
+    AR["LiveKit AvatarRunner + VideoGenerator wrapper<br/>selected when video_config.mode == SEAMLESS"]
+
+    subgraph gen["AlwaysBusyGenerator — generator.py"]
+        API["push_audio / interrupt / aclose"]
+        ITER["__aiter__<br/>(video, audio) | SequenceEnd"]
+        OBS["SequenceObserver — observer.py<br/>mirrors TALKING streams only"]
+    end
+
+    subgraph turn["per talking turn"]
+        TP["TalkingProducer<br/>AudioPreprocessor · sentiment once<br/>morph on last chunk"]
+        TS(["talking InferenceStream"])
+    end
+
+    subgraph fill["idle filler — Driver-owned"]
+        IP["IdleProducer<br/>silent chunks forever<br/>morph every 4th chunk"]
+        IST(["idle InferenceStream"])
+    end
+
+    subgraph drv["Driver — driver.py"]
+        SQ["StreamQueue<br/>FIFO · head ready-gated"]
+        LOOP["_drive_loop<br/>drive current vs next ready"]
+        PIPE["dispatcher → inference_buffer (1.0s) → pacer"]
+        BQ["broadcast_queue<br/>TargetedQueue · 0.2s target"]
+    end
+
+    subgraph sess["InferenceSession — inference_session.py"]
+        IS["infer_chunk<br/>up to 4 attempts · worker rotation"]
+        RING["context ring<br/>last 10 paced frames (motion, audio)"]
+        SS["_SessionStream<br/>1 gRPC stream = 1 Triton sequence"]
+    end
+
+    LB["TritonLoadBalancer<br/>Redis · key prefix = worker_pool"]
+    TR["Triton worker pool<br/>expressive_avatar_always_busy"]
+    SM["SessionManager<br/>sequences · stages · metrics"]
+
+    AR -- "push_audio(frame | end) · clear_buffer()" --> API
+    API -- "audio per turn" --> TP
+    API -- "commit(stream)" --> SQ
+    TP -- "InferenceChunk" --> TS
+    IP -- "InferenceChunk" --> IST
+    LOOP -- "spawns between turns" --> IP
+    SQ --> LOOP
+    TS --> PIPE
+    IST --> PIPE
+    LOOP --> PIPE
+    PIPE -- "Request per chunk" --> IS
+    IS --> SS
+    SS -- "gRPC" --> TR
+    IS -. "find_optimal_server" .-> LB
+    IS -- "on_frame per video frame" --> PIPE
+    PIPE -- "commit_to_context<br/>(paced frames only)" --> RING
+    PIPE --> BQ
+    BQ -- "PairedFrame | StreamEnd" --> ITER
+    ITER -- "TALKING frames / ends" --> OBS
+    OBS -- "start / end / fail sequence" --> SM
+    ITER -- "rtc frames | AudioSegmentEnd" --> AR
